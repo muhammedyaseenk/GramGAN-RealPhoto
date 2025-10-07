@@ -2,7 +2,7 @@
 Gram-GAN bridges pixel-based and GAN SR methods, generating sharp and realistic textures by explicitly matching generated patches to real HR textures via a Gram-based patch database. It ensures stable training, better generalization, and texture-aware outputs—ideal for satellite, medical, art, and fashion super-resolution tasks.
 
 
-# Gram-GAN: Texture-Aware Super-Resolution
+## Overview: Gram-GAN - Texture-Aware Super-Resolution
 
 **Gram-GAN** is a super-resolution GAN designed to generate **sharp and realistic textures** by explicitly guiding the generator with a **Gram-based patch database** derived from high-resolution images. It bridges the gap between pixel-based SR methods and GAN-based SR, providing perceptually realistic results while stabilizing adversarial training.
 
