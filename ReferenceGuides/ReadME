@@ -1,0 +1,174 @@
+
+Objective: Super-Resolution (x4) with Texture & Perceptual Realism.
+Overall Components:
+Generator (G): RRDBNet - Handles SR.
+Discriminator (D): DiscriminatorVGGStyle - Realism judgment & feature extraction for L_DP.
+Feature Extractor: VGG19Features - For L_P.
+Patch Candidate DB: Real-time texture bank for L_PT.
+Loss Functions: L_PT, L_DP, L_P, L_G (Adversarial), L_C (Content).
+Data Processing: DIV2KTrainDataset, build_mask_from_image.
+1. Generator (G): RRDBNet (in_nc=3, out_nc=3, nf=64, nb=23, gc=32, scale=4)
+Input: Low-Resolution (LR) Image Tensor (B, 3, H_LR, W_LR)
+Output: Super-Resolved (SR) Image Tensor (B, 3, H_HR, W_HR) where H_HR = 4 * H_LR, W_HR = 4 * W_LR.
+Internal Structure:
+conv_first (Feature Extraction)
+nn.Conv2d(in_channels=3, out_channels=64, kernel_size=3, stride=1, padding=1)
+Output: (B, 64, H_LR, W_LR)
+RRDB_trunk (Deep Feature Learning)
+nn.Sequential(*[RRDB(nf=64, gc=32) for _ in range(23)])
+This is the main "body" of the generator, consisting of nb=23 identical RRDB modules.
+Each RRDB (Residual-in-Residual Dense Block):
+Input: (B, 64, H_LR, W_LR)
+Output: (B, 64, H_LR, W_LR)
+Internal Structure of one RRDB:
+rdb1, rdb2, rdb3: Three ResidualDenseBlock_5C modules in sequence.
+Each ResidualDenseBlock_5C has a local residual connection (input + output * scale=0.2).
+Inside ResidualDenseBlock_5C (nf=64, gc=32):
+conv1: Conv2d(nf=64, gc=32, 3x1x1) -> (B, 32, H, W) -> lrelu
+conv2: Conv2d(nf+gc=96, gc=32, 3x1x1) -> (B, 32, H, W) -> lrelu (Input: [x, x1])
+conv3: Conv2d(nf+2*gc=128, gc=32, 3x1x1) -> (B, 32, H, W) -> lrelu (Input: [x, x1, x2])
+conv4: Conv2d(nf+3*gc=160, gc=32, 3x1x1) -> (B, 32, H, W) -> lrelu (Input: [x, x1, x2, x3])
+conv5: Conv2d(nf+4*gc=192, nf=64, 3x1x1) -> (B, 64, H, W) (Input: [x, x1, x2, x3, x4])
+Dense Connections: torch.cat is used to combine features from previous layers within the block.
+Output: x + x5 * scale (Residual connection from input of ResidualDenseBlock_5C to its output, scaled).
+Output of RRDB: input_to_RRDB + (rdb1_out + rdb2_out + rdb3_out) * scale (Global residual connection for the whole RRDB, scaled).
+Output of RRDB_trunk: (B, 64, H_LR, W_LR)
+trunk_conv (Residual Path for fea)
+nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, stride=1, padding=1)
+Output: (B, 64, H_LR, W_LR)
+This output is added to fea (output of conv_first) via a global residual connection.
+Upsampling Path (x4 total)
+Upsample 1 (x2):
+upconv1: nn.Conv2d(in_channels=64, out_channels=64 * 4, kernel_size=3, stride=1, padding=1)
+upsampler: nn.PixelShuffle(upscale_factor=2) (Reshapes (B, C*r^2, H, W) to (B, C, H*r, W*r))
+lrelu
+Output: (B, 64, H_LR * 2, W_LR * 2)
+Upsample 2 (x2):
+upconv2: nn.Conv2d(in_channels=64, out_channels=64 * 4, kernel_size=3, stride=1, padding=1)
+upsampler: nn.PixelShuffle(upscale_factor=2)
+lrelu
+Output: (B, 64, H_LR * 4, W_LR * 4)
+hr_conv (HR Feature Refinement)
+nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, stride=1, padding=1)
+lrelu
+Output: (B, 64, H_HR, W_HR)
+conv_last (Final Output Layer)
+nn.Conv2d(in_channels=64, out_channels=3, kernel_size=3, stride=1, padding=1)
+Output: (B, 3, H_HR, W_HR) (The Super-Resolved Image)
+2. Discriminator (D): DiscriminatorVGGStyle (in_nc=3)
+Input: Image Tensor (B, 3, H, W) (usually HR or SR)
+Output: Logits (B, 1) (Real/Fake score) and feature maps for L_DP.
+Internal Structure:
+A sequence of Conv2d layers followed by LeakyReLU(0.2, inplace=True).
+Uses stride=2 for downsampling after certain convolutions, similar to VGG.
+Feature map sizes: (64, H/2, W/2), (128, H/4, W/4), (256, H/8, W/8), (512, H/16, W/16), (512, H/32, W/32).
+Conv Blocks:
+[C=3 -> 64, K=3, S=1, P=1] -> LRelu
+[C=64 -> 64, K=3, S=2, P=1] -> LRelu (Downsample x2)
+[C=64 -> 128, K=3, S=1, P=1] -> LRelu
+[C=128 -> 128, K=3, S=2, P=1] -> LRelu (Downsample x2)
+[C=128 -> 256, K=3, S=1, P=1] -> LRelu
+[C=256 -> 256, K=3, S=2, P=1] -> LRelu (Downsample x2)
+[C=256 -> 512, K=3, S=1, P=1] -> LRelu
+[C=512 -> 512, K=3, S=2, P=1] -> LRelu (Downsample x2)
+[C=512 -> 1024, K=3, S=1, P=1] -> LRelu
+[C=1024 -> 1024, K=3, S=2, P=1] -> LRelu (Downsample x2)
+[C=1024 -> 1024, K=3, S=1, P=1] -> LRelu
+Feature Extraction Points: Returns activations after conv5 (index 9 in self.features list, after C*4 block, (B, 256, H/8, W/8) before last stride 2 conv) and conv11 (index 21, after C*16 block, (B, 1024, H/32, W/32)). These are used for L_DP.
+Classifier:
+nn.AdaptiveAvgPool2d(output_size=1) (Reduces feature maps to (B, 1024, 1, 1))
+nn.Flatten() (Transforms to (B, 1024))
+nn.Linear(1024, 100) -> LeakyReLU
+nn.Linear(100, 1) (Final logit score)
+3. Feature Extractor: VGG19Features
+Pre-trained VGG19: models.vgg19(weights=models.VGG19_Weights.IMAGENET1K_V1).features
+Layers Used (IDs based on vgg.features sequential module):
+conv3_4: After 16th layer (nn.Conv2d corresponding to VGG block 3, 4th conv).
+conv4_4: After 23rd layer (nn.Conv2d corresponding to VGG block 4, 4th conv).
+conv5_4: After 30th layer (nn.Conv2d corresponding to VGG block 5, 4th conv).
+Purpose: Extract perceptual features for L_P (Perceptual VGG Loss). Weights are frozen (requires_grad = False).
+4. Patch Candidate DB (PatchCandidateDB)
+Purpose: Stores a library of real HR texture patches and their Gram matrices for texture matching.
+Construction:
+Samples max_patches (e.g., 200,000) small patches (e.g., patch_size=4) from hr_dir.
+For each patch p, it creates three versions:
+Original p
+Downsampled and then Upsampled p_du
+Affinely Transformed p_aff
+For each version, gram_matrix(p_tensor) is computed and stored.
+Optionally builds a FAISS index (FlatL2) over the flattened Gram matrices for fast nearest-neighbor search.
+Usage (find_best_patch):
+During Generator training, for a given SR_patch (ei) and corresponding HR_patch (gi), their Gram matrices (Gei, Ggi) are computed.
+The DB searches for p_star from its stored patches such that its Gram matrix (Gp) minimizes:
+score = alpha * ||Gp - Ggi||^2 + beta * ||Gp - Gei||^2
+p_star is then returned (or its Gram matrix) as the target for L_PT.
+5. Loss Functions (GramGANLoss)
+L_PT (Patch Texture Loss):
+F.l1_loss(Gram(SR_patch), Gram(p_star))
+p_star is the best-matched real HR patch from PatchCandidateDB.
+η_PT weight (default 1.0).
+L_DP (Discriminator Perceptual Loss):
+L1_loss(Discriminator_Features(SR_masked), Discriminator_Features(HR_masked))
+Calculated using D_fake_feats2 and D_real_feats2 (from the second discriminator pass in generator training).
+η_DP weight (default 1.0).
+L_P (VGG Perceptual Loss):
+Sum of weighted L1_loss between VGG features of SR and HR images.
+vgg_layer_weights = {'conv3_4':1/8.0, 'conv4_4':1/4.0, 'conv5_4':1/2.0}
+η_P weight (default 1.0).
+L_C (Content Loss):
+F.l1_loss(SR, HR) (Pixel-wise L1 difference between Super-Resolved and High-Resolution images).
+η_C weight (default 1.0).
+L_G (Adversarial Loss - Generator):
+ra_adversarial_losses(D_real_logits, D_fake_logits)
+Uses Relativistic Average GAN (RaGAN): Generator tries to make generated images more realistic than real images on average, and real images less realistic than fake images on average.
+LG_real = bce(C_real_logits - real_mean, zeros)
+LG_fake = bce(C_fake_logits - fake_mean, ones)
+L_G = LG_real + LG_fake
+η_G weight (default 0.005).
+L_D (Adversarial Loss - Discriminator):
+ra_adversarial_losses(D_real_logits, D_fake_logits)
+Discriminator tries to make real images more realistic than fake images on average, and generated images less realistic than real images on average.
+LD_real = bce(C_real_logits - real_mean, ones)
+LD_fake = bce(C_fake_logits - fake_mean, zeros)
+L_D = LD_real + LD_fake
+6. Mask Generation (build_mask_from_image)
+Purpose: To create a binary mask that highlights textured regions in the HR image.
+Mechanism:
+Divides HR image into 11x11 patches.
+Calculates the standard deviation of pixel values within each patch (across channels, then averaged).
+If std dev std >= delta (default 0.005), the patch is considered "textured" and gets a mask value of 1. Else, 0.
+The coarse mask (B, 1, n_h, n_w) is then upsampled to the full HR image size (B, 1, H, W) using F.interpolate(mode='nearest').
+Usage:
+hr_masked = hr * mask
+sr_masked = sr * mask
+The discriminator is trained on these masked images (D(hr_masked) and D(sr_masked)), ensuring it focuses on relevant textural parts and ignores flat backgrounds that might cause artifacts.
+7. Training Loop (train function)
+Load Data: DataLoader provides (LR, HR) image pairs.
+Generate SR: sr = G(lr)
+Compute Mask: mask = build_mask_from_image(hr)
+Discriminator Training (D steps):
+D_real_logits, D_real_feats = D(hr_masked)
+D_fake_logits, D_fake_feats = D(sr_masked.detach()) (Generator is detached)
+LD, _ = ra_adversarial_losses(D_real_logits, D_fake_logits)
+LD.backward(); optD.step()
+Generator Training (G steps):
+(Second D pass for G's loss calculation, no detach for sr_masked)
+D_real_logits2, D_real_feats2 = D(hr_masked)
+D_fake_logits2, D_fake_feats2 = D(sr_masked)
+Patch Texture Loss (L_PT):
+Extract center 4x4 patches ei from sr and gi from hr.
+Compute Ggi = gram_matrix(gi) and Gei = gram_matrix(ei).
+p_star = patch_db.find_best_patch(Ggi, Gei, alpha=0.5, beta=0.5)
+Gpstar = gram_matrix(p_star).
+L_PT = losses.patch_texture_loss(Gei, Gpstar).
+Discriminator Perceptual Loss (L_DP):
+L_DP = losses.discriminator_perceptual(D_fake_feats2, D_real_feats2).
+VGG Perceptual Loss (L_P):
+L_P = losses.perceptual_vgg(sr, hr).
+Content Loss (L_C):
+L_C = losses.content_loss(sr, hr).
+Adversarial Loss (L_G):
+_, LG = ra_adversarial_losses(D_real_logits2, D_fake_logits2).
+Total Generator Loss: total_G = η_PT*L_PT + η_DP*L_DP + η_P*L_P + η_G*LG + η_C*L_C
+total_G.backward(); optG.step()
+Learning Rate Scheduling: adjust_lr_warmup_cosine applied to both optimizers.
