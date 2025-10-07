@@ -132,7 +132,7 @@ GrahamGAN enhances low-resolution images using:
 
 ```bash
 # Clone repository
-git clone <repository-url>
+git clone https://github.com/muhammedyaseenk/GramGAN-RealPhoto.git
 cd GrahamGAN
 
 # Install dependencies
